@@ -504,21 +504,6 @@
   <div class="focus-hint">Phone face-down, one task, one timer. Anything else can wait 25 minutes.</div>
 </div>
 
-<div class="sheet-backdrop" id="sheetBackdrop">
-  <div class="sheet glass">
-    <h2>Break down tasks with Claude</h2>
-    <p>Focusflow can ask Claude to split a task into small first steps. That needs a Claude API key —
-      get one at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.
-      The key is stored only in this browser, and each breakdown costs a fraction of a cent.</p>
-    <input type="password" id="apiKeyInput" placeholder="sk-ant-…" autocomplete="off">
-    <div class="sheet-btns">
-      <button class="sb-primary" id="sheetSave">Save key</button>
-      <button class="sb-secondary" id="sheetManual">Write steps myself</button>
-      <button class="sb-plain" id="sheetCancel">Cancel</button>
-    </div>
-  </div>
-</div>
-
 <div class="toast" id="toast"></div>
 
 <script>
@@ -680,6 +665,7 @@
   function taskBlock(t) {
     const wrap = document.createElement('div');
     wrap.className = 'tblock';
+    wrap.dataset.tid = t.id;
     wrap.appendChild(rowEl(t));
     if (!t.done && t.steps) {
       const panel = document.createElement('div');
@@ -755,12 +741,12 @@
     if (t.done) {
       stepsControl = '';
     } else if (!t.steps) {
-      stepsControl = '<button class="link-btn steps-btn' + (generating.has(t.id) ? ' busy' : '') + '">' +
-        (generating.has(t.id) ? 'Breaking down…' : 'Steps') + '</button>';
+      stepsControl = '<button class="link-btn steps-btn">＋ Steps</button>';
     } else {
       const open = expandedTasks.has(t.id);
+      const label = prog ? (prog.done + '/' + prog.total) : 'Steps'; // empty list: no counter yet
       stepsControl = '<button class="steps-toggle' + (open ? ' open' : '') + '">' + CHEVRON_SVG +
-        '<span>' + prog.done + '/' + prog.total + '</span></button>';
+        '<span>' + label + '</span></button>';
     }
     el.innerHTML =
       (prog ? '<div class="row-progress" style="width:' + prog.pct + '%"></div>' : '') +
@@ -791,7 +777,7 @@
     const fb = el.querySelector('.focus-btn');
     if (fb) fb.onclick = () => startFocus(t.id);
     const sb = el.querySelector('.steps-btn');
-    if (sb) sb.onclick = () => requestSteps(t.id);
+    if (sb) sb.onclick = () => startSteps(t.id);
     const tb = el.querySelector('.steps-toggle');
     if (tb) tb.onclick = () => {
       if (expandedTasks.has(t.id)) expandedTasks.delete(t.id);
@@ -811,10 +797,15 @@
       toast('Filed under ' + (cat === 'work' ? 'Work' : 'Personal') + ' · tap its label to change');
     }
     const task = { id: Date.now() + Math.random(), text, cat, dif: newDif, done: false };
-    // Exact repeat? Restore its steps instantly (no API call).
+    // 1. Exact repeat → restore its steps instantly.
     const remembered = memGetSteps(normText(text));
+    // 2. Otherwise look for the same job worded differently (local gist match).
+    const gist = remembered ? null : findGistMatch(text);
     if (remembered) {
       task.steps = remembered.map(s => ({ text: s, done: false }));
+      expandedTasks.add(task.id);
+    } else if (gist) {
+      task.steps = gist.steps.map(s => ({ text: s, done: false }));
       expandedTasks.add(task.id);
     }
     state.tasks.unshift(task);
@@ -822,12 +813,8 @@
     input.focus();
     save();
     renderTasks();
-    if (remembered) {
-      toast('Done this before — restored ' + remembered.length + ' saved steps');
-    } else {
-      // No exact hit — let Claude check if it's the same job worded differently
-      maybeMatchFromHistory(task.id);
-    }
+    if (remembered) toast('Done this before — restored ' + remembered.length + ' saved steps');
+    else if (gist) toast('Looks like “' + gist.label + '” — restored its steps');
   }
 
   function toggleTask(id, bonus = 0) {
@@ -968,171 +955,59 @@
   initSeg('difSeg', v => { newDif = v; });
   initSeg('filterSeg', v => { filter = v; renderTasks(); });
 
-  // ---- Task breakdown via Claude ----
-  const KEY_STORAGE = 'focusquest.apikey';
-  const generating = new Set();
-  let pendingStepsTaskId = null;
+  // ---- Local "gist" memory matching (no AI, no key, no cost) ----
+  // Common action-verbs + filler that shouldn't drive a match on their own.
+  const MATCH_STOP = new Set(['the','and','for','with','my','your','our','a','an','to','of','on','in','at','it','is','this','that','some','from','about','into','over','out','off','up','down','me','you','we','i',
+    'do','make','get','go','take','put','call','text','send','buy','finish','start','check','update','review','run','set','pick','plan','write','read','fix','book','pay','clean','email','schedule','organize','organise','prepare','prep','work','handle','sort','file']);
 
-  async function breakdownWithClaude(t) {
-    const key = localStorage.getItem(KEY_STORAGE);
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5',
-        max_tokens: 1024,
-        system: 'You break a single to-do item into 2-5 small, concrete, immediately actionable first steps. ' +
-          'Each step should be startable in under 10 minutes, ordered, specific to the task, and phrased as a short imperative (max ~10 words). ' +
-          'Do not restate the task itself as a step.',
-        output_config: {
-          format: {
-            type: 'json_schema',
-            schema: {
-              type: 'object',
-              properties: { steps: { type: 'array', items: { type: 'string' } } },
-              required: ['steps'],
-              additionalProperties: false
-            }
-          }
-        },
-        messages: [{
-          role: 'user',
-          content: 'Break down this ' + (t.cat === 'work' ? 'work' : 'personal') + ' to-do into first steps: "' + t.text + '"'
-        }]
-      })
+  function stemWord(w) {
+    if (w.length > 4 && w.endsWith('ies')) return w.slice(0, -3) + 'y';
+    if (w.length > 4 && w.endsWith('ing')) return w.slice(0, -3);
+    if (w.length > 4 && w.endsWith('ed')) return w.slice(0, -2);
+    if (w.length > 3 && w.endsWith('es')) return w.slice(0, -2);
+    if (w.length > 2 && w.endsWith('s') && !w.endsWith('ss')) return w.slice(0, -1);
+    return w;
+  }
+  // Distinctive word-roots of a task label (drops filler + common verbs)
+  function keyStems(text) {
+    const out = new Set();
+    normText(text).split(/[^a-z0-9]+/).forEach(w => {
+      if (w.length >= 2 && !MATCH_STOP.has(w)) out.add(stemWord(w));
     });
-    if (res.status === 401) {
-      localStorage.removeItem(KEY_STORAGE);
-      throw new Error('That API key was rejected — tap Steps to enter a new one');
-    }
-    if (!res.ok) throw new Error('Claude request failed (' + res.status + ')');
-    const data = await res.json();
-    if (data.stop_reason === 'refusal') throw new Error('Claude declined to break that one down');
-    const textBlock = (data.content || []).find(b => b.type === 'text');
-    if (!textBlock) throw new Error('Unexpected response from Claude');
-    return JSON.parse(textBlock.text).steps.slice(0, 6);
+    return out;
   }
-
-  // Ask Claude which remembered task (if any) is the same recurring job as `text`
-  async function claudeMatch(text, candidates) {
-    const key = localStorage.getItem(KEY_STORAGE);
-    if (!key) return -1;
-    const list = candidates.map((c, i) => i + '. ' + c.label).join('\n');
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5',
-        max_tokens: 256,
-        system: 'You decide whether a new to-do is essentially the same recurring task as one the user has done before — the same underlying job, even if worded more briefly, less specifically, or differently (e.g. "do my taxes" matches "do my taxes with Rick"; "run ads" matches "launch the Facebook ad campaign"). Only match when it is genuinely the same recurring activity, not merely a related topic.',
-        output_config: {
-          format: {
-            type: 'json_schema',
-            schema: {
-              type: 'object',
-              properties: { match: { type: 'integer' } },
-              required: ['match'],
-              additionalProperties: false
-            }
-          }
-        },
-        messages: [{
-          role: 'user',
-          content: 'New task: "' + text + '"\n\nPast tasks:\n' + list +
-            '\n\nWhich past task number is the same recurring task as the new one? Reply with that number, or -1 if none is genuinely the same.'
-        }]
-      })
+  // Best remembered task whose gist overlaps the new one, or null. Matches on shared
+  // word-roots, so exact wording isn't needed ("run ads" -> "the ad campaign").
+  function findGistMatch(text) {
+    const wanted = keyStems(text);
+    if (!wanted.size) return null;
+    const selfKey = normText(text);
+    let best = null, bestScore = 0;
+    memList().forEach(m => {
+      if (m.key === selfKey) return;
+      const have = keyStems(m.label);
+      let shared = 0;
+      wanted.forEach(s => { if (have.has(s)) shared++; });
+      const score = shared / wanted.size; // fraction of the new task's key words matched
+      if (score > bestScore) { bestScore = score; best = m; }
     });
-    if (!res.ok) return -1;
-    const data = await res.json();
-    if (data.stop_reason === 'refusal') return -1;
-    const tb = (data.content || []).find(b => b.type === 'text');
-    if (!tb) return -1;
-    const idx = JSON.parse(tb.text).match;
-    return (typeof idx === 'number') ? idx : -1;
+    // Require most of the new task's distinctive words to line up, to avoid loose matches
+    return bestScore >= 0.6 ? best : null;
   }
 
-  // After a task is added with no exact-match steps, see if it's a fuzzy repeat
-  async function maybeMatchFromHistory(taskId) {
-    const t = state.tasks.find(x => x.id === taskId);
-    if (!t || t.steps || !localStorage.getItem(KEY_STORAGE)) return;
-    // Send remembered task names to Claude (capped) — it judges the gist, not literal words
-    const candidates = memList().filter(m => m.key !== normText(t.text)).slice(0, 40);
-    if (!candidates.length) return;
-    try {
-      const idx = await claudeMatch(t.text, candidates);
-      const cur = state.tasks.find(x => x.id === taskId);
-      if (idx >= 0 && idx < candidates.length && cur && !cur.done && !cur.steps) {
-        cur.steps = candidates[idx].steps.map(s => ({ text: s, done: false }));
-        expandedTasks.add(cur.id);
-        save();
-        renderTasks();
-        toast('Looks like “' + candidates[idx].label + '” — restored its steps');
-      }
-    } catch (e) { /* fuzzy match is a bonus, never block on it */ }
-  }
-
-  async function requestSteps(id) {
+  // Manually start a step list on a task, then focus the input to type your own
+  function startSteps(id) {
     const t = state.tasks.find(x => x.id === id);
-    if (!t || t.done || generating.has(id)) return;
-    if (!localStorage.getItem(KEY_STORAGE)) {
-      pendingStepsTaskId = id;
-      document.getElementById('sheetBackdrop').classList.add('show');
-      document.getElementById('apiKeyInput').focus();
-      return;
-    }
-    generating.add(id);
+    if (!t || t.done) return;
+    if (!t.steps) t.steps = [];
+    expandedTasks.add(id);
+    save();
     renderTasks();
-    try {
-      const steps = await breakdownWithClaude(t);
-      const cur = state.tasks.find(x => x.id === id);
-      if (cur && !cur.done && steps.length) {
-        cur.steps = steps.map(s => ({ text: s, done: false }));
-        expandedTasks.add(id);
-        save();
-        toast('Broken into ' + steps.length + ' steps · +5 XP each');
-      }
-    } catch (e) {
-      toast(e.message || 'Couldn’t reach Claude — check your connection');
-    } finally {
-      generating.delete(id);
-      renderTasks();
-    }
+    const box = document.querySelector('.tblock[data-tid="' + id + '"] .add-step input');
+    if (box) box.focus();
   }
 
-  // ---- API key sheet ----
-  function closeSheet() {
-    document.getElementById('sheetBackdrop').classList.remove('show');
-    pendingStepsTaskId = null;
-  }
-  document.getElementById('sheetSave').onclick = () => {
-    const val = document.getElementById('apiKeyInput').value.trim();
-    if (!val) return;
-    localStorage.setItem(KEY_STORAGE, val);
-    document.getElementById('apiKeyInput').value = '';
-    const id = pendingStepsTaskId;
-    closeSheet();
-    if (id != null) requestSteps(id);
-  };
-  document.getElementById('sheetManual').onclick = () => {
-    const t = state.tasks.find(x => x.id === pendingStepsTaskId);
-    if (t && !t.steps) { t.steps = []; expandedTasks.add(t.id); save(); renderTasks(); }
-    closeSheet();
-  };
-  document.getElementById('sheetCancel').onclick = closeSheet;
-  document.getElementById('sheetBackdrop').addEventListener('click', e => {
-    if (e.target === e.currentTarget) closeSheet();
-  });
+  // (AI breakdown + API-key sheet removed — steps are written manually now)
 
   // ---- Voice input (Web Speech API — Chrome/Edge) ----
   const micBtn = document.getElementById('micBtn');
