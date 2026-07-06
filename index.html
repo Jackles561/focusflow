@@ -269,6 +269,12 @@
   .step.done .s-check svg { opacity: 1; transform: scale(1); }
   .s-text { flex: 1; min-width: 0; font-size: 14px; letter-spacing: -0.01em; word-wrap: break-word; }
   .step.done .s-text { color: var(--text3); text-decoration: line-through; }
+  /* Inline editing */
+  .r-text, .s-text { cursor: text; }
+  .r-text[contenteditable]:focus, .s-text[contenteditable]:focus {
+    outline: none; box-shadow: 0 0 0 3px var(--seg-track); border-radius: 5px;
+    text-decoration: none; color: var(--text);
+  }
   .s-xp { font-size: 11px; font-weight: 600; color: var(--text3); }
   .add-step { padding: 3px 16px 12px 56px; }
   .add-step input {
@@ -662,6 +668,21 @@
 
   const expandedTasks = new Set();
 
+  // Make a text node click-to-edit: Enter or blur saves, Escape cancels, empty reverts
+  function makeEditable(node, getVal, setVal) {
+    node.setAttribute('contenteditable', 'true');
+    node.spellcheck = false;
+    node.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); node.blur(); }
+      else if (e.key === 'Escape') { node.textContent = getVal(); node.blur(); }
+    });
+    node.addEventListener('blur', () => {
+      const v = node.textContent.trim();
+      if (v && v !== getVal()) { setVal(v); save(); renderTasks(); }
+      else { node.textContent = getVal(); }
+    });
+  }
+
   function taskBlock(t) {
     const wrap = document.createElement('div');
     wrap.className = 'tblock';
@@ -684,7 +705,9 @@
       '<button class="s-check" aria-label="Complete step">' + CHECK_SVG + '</button>' +
       '<div class="s-text"></div><span class="s-xp">+5</span>' +
       '<button class="del-btn" aria-label="Delete step">' + TRASH_SVG + '</button>';
-    el.querySelector('.s-text').textContent = s.text;
+    const stext = el.querySelector('.s-text');
+    stext.textContent = s.text;
+    makeEditable(stext, () => s.text, v => { s.text = v; });
     el.querySelector('.s-check').onclick = () => toggleStep(t.id, i);
     el.querySelector('.del-btn').onclick = () => { t.steps.splice(i, 1); save(); renderTasks(); };
     return el;
@@ -758,7 +781,9 @@
       '<div class="r-actions">' + stepsControl +
       (t.done ? '' : '<button class="link-btn focus-btn">Focus</button>') +
       '<button class="del-btn task-del" aria-label="Delete task">' + TRASH_SVG + '</button></div>';
-    el.querySelector('.r-text').textContent = t.text;
+    const rtext = el.querySelector('.r-text');
+    rtext.textContent = t.text;
+    makeEditable(rtext, () => t.text, v => { t.text = v; });
     el.querySelector('.check').onclick = (e) => {
       e.currentTarget.classList.add('pop');
       setTimeout(() => toggleTask(t.id), 160);
